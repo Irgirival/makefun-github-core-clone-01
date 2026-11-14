@@ -79,6 +79,18 @@ async function main(): Promise<void> {
   }
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
+  // The harness SIGTERMs the entry once the trial is over; close the server
+  // and leave cleanly instead of dying mid-request with a dangling listener.
+  let shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
