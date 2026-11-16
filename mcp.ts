@@ -18,7 +18,7 @@
 // byte for byte. Tools act on the same store as REST, so a repository or an
 // issue created over MCP reads back over /api/v3 as the same object.
 
-import { FIXED_ISO, Store, VIEWER_LOGIN, type Issue, type PullRequest, type Repo } from './store.ts';
+import { FIXED_ISO, Store, VIEWER_LOGIN, invalidateIssueJson, type Issue, type PullRequest, type Repo } from './store.ts';
 
 export const MCP_REVISION = '2026-07-28';
 export const MCP_SUPPORTED_REVISIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
@@ -266,8 +266,8 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       for (const label of labels) {
         if (!repo.labels.has(label)) return { ok: false, error: `Label "${label}" does not exist` };
       }
-      const issue: Issue = { id: store.nextId(), number: repo.nextNumber++, title, body, state: 'open', labels, comments: [] };
-      repo.issues.push(issue);
+      const issue: Issue = { id: store.nextId(), number: repo.nextNumber++, title, body, state: 'open', labels, comments: [], jsonCache: null };
+      repo.addIssue(issue);
       return { ok: true, value: issueJson(repo, issue) };
     }
     case 'get_issue': {
@@ -276,7 +276,7 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       if (!target) return { ok: false, error: 'Missing required arguments: owner, repo' };
       if (number === undefined) return { ok: false, error: 'Missing required argument: number' };
       const repo = store.getRepo(target.owner, target.repo);
-      const issue = repo?.issues.find((entry) => entry.number === number);
+      const issue = repo?.findIssue(number);
       if (!issue || !repo) return { ok: false, error: `Issue #${number} not found` };
       return { ok: true, value: issueJson(repo, issue) };
     }
@@ -295,9 +295,10 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       if (!target) return { ok: false, error: 'Missing required arguments: owner, repo' };
       if (number === undefined) return { ok: false, error: 'Missing required argument: number' };
       const repo = store.getRepo(target.owner, target.repo);
-      const issue = repo?.issues.find((entry) => entry.number === number);
+      const issue = repo?.findIssue(number);
       if (!issue || !repo) return { ok: false, error: `Issue #${number} not found` };
       issue.state = 'closed';
+      invalidateIssueJson(issue);
       return { ok: true, value: issueJson(repo, issue) };
     }
     case 'create_pull_request': {
@@ -331,7 +332,7 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
         mergedAt: null,
         mergeSha: null,
       };
-      repo.pulls.push(pull);
+      repo.addPull(pull);
       return { ok: true, value: pullJson(repo, pull) };
     }
     case 'get_pull_request': {
@@ -340,7 +341,7 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       if (!target) return { ok: false, error: 'Missing required arguments: owner, repo' };
       if (number === undefined) return { ok: false, error: 'Missing required argument: number' };
       const repo = store.getRepo(target.owner, target.repo);
-      const pull = repo?.pulls.find((entry) => entry.number === number);
+      const pull = repo?.findPull(number);
       if (!pull || !repo) return { ok: false, error: `Pull request #${number} not found` };
       return { ok: true, value: pullJson(repo, pull) };
     }
@@ -359,7 +360,7 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       if (!target) return { ok: false, error: 'Missing required arguments: owner, repo' };
       if (number === undefined) return { ok: false, error: 'Missing required argument: pull_number' };
       const repo = store.getRepo(target.owner, target.repo);
-      const pull = repo?.pulls.find((entry) => entry.number === number);
+      const pull = repo?.findPull(number);
       if (!pull || !repo) return { ok: false, error: `Pull request #${number} not found` };
       if (pull.merged || pull.state !== 'open') return { ok: false, error: `Pull request #${number} is not open` };
       const mergeSha = repo.squashMerge(pull);
@@ -368,7 +369,7 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       pull.mergedAt = FIXED_ISO;
       pull.mergeSha = mergeSha;
       pull.state = 'closed';
-      repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+      repo.setRef(`refs/heads/${pull.baseRef}`, mergeSha);
       return { ok: true, value: { sha: mergeSha, merged: true, message: `Merged pull request #${number}` } };
     }
     case 'add_comment': {
@@ -379,10 +380,11 @@ function executeTool(store: Store, name: string, args: Args): ToolOutcome {
       if (number === undefined) return { ok: false, error: 'Missing required argument: number' };
       if (body === undefined) return { ok: false, error: 'Missing required argument: body' };
       const repo = store.getRepo(target.owner, target.repo);
-      const issue = repo?.issues.find((entry) => entry.number === number);
+      const issue = repo?.findIssue(number);
       if (!issue || !repo) return { ok: false, error: `Issue #${number} not found` };
       const comment = { id: repo.nextCommentId++, body };
       issue.comments.push(comment);
+      invalidateIssueJson(issue);
       return { ok: true, value: { id: comment.id, body } };
     }
     default:

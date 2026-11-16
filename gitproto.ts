@@ -53,17 +53,31 @@ export type Packet =
   | { kind: 'delim' }
   | { kind: 'response-end' };
 
-const HEX4 = /^[0-9a-fA-F]{4}$/;
+const HEX_VAL = new Int8Array(128).fill(-1);
+for (let i = 0; i < 10; i += 1) HEX_VAL[48 + i] = i;
+for (let i = 0; i < 6; i += 1) {
+  HEX_VAL[97 + i] = 10 + i;
+  HEX_VAL[65 + i] = 10 + i;
+}
+
+/** The 4-hex length at `offset`, or -1 when it is not four hex digits. No regex. */
+function pktLengthAt(bytes: Buffer, offset: number): number {
+  if (offset + 4 > bytes.length) return -1;
+  const a = bytes[offset] < 128 ? HEX_VAL[bytes[offset]] : -1;
+  const b = bytes[offset + 1] < 128 ? HEX_VAL[bytes[offset + 1]] : -1;
+  const c = bytes[offset + 2] < 128 ? HEX_VAL[bytes[offset + 2]] : -1;
+  const d = bytes[offset + 3] < 128 ? HEX_VAL[bytes[offset + 3]] : -1;
+  if (a < 0 || b < 0 || c < 0 || d < 0) return -1;
+  return (a << 12) | (b << 8) | (c << 4) | d;
+}
 
 /** Decode a whole buffer of pkt-lines; throws on a malformed header. */
 export function decodePktLines(bytes: Buffer): Packet[] {
   const packets: Packet[] = [];
   let offset = 0;
   while (offset < bytes.length) {
-    if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
-    const head = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const length = Number.parseInt(head, 16);
+    const length = pktLengthAt(bytes, offset);
+    if (length < 0) throw new Error('invalid pkt-line header');
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -162,8 +176,8 @@ export function peelOid(repo: Repo, oid: string): string {
 // ---------------------------------------------------------------------------------------------
 
 export interface FetchSelection {
-  /** Objects to send, in a deterministic order. */
-  objects: GitObject[];
+  /** Objects to send, in a deterministic order (oid carried for the deflate cache). */
+  objects: Array<GitObject & { oid: string }>;
   /** Commits included whose parents were cut off (the shallow boundary). */
   shallow: string[];
   /** Previously-shallow commits now fully included. */
@@ -266,11 +280,11 @@ export function selectFetchObjects(
     }
   }
   for (const oid of allWanted) wanted.add(oid);
-  const send: GitObject[] = [];
+  const send: Array<GitObject & { oid: string }> = [];
   for (const oid of [...wanted].sort()) {
     if (held.has(oid)) continue;
     const object = repo.objects.get(oid);
-    if (object) send.push(object);
+    if (object) send.push({ ...object, oid });
   }
   // Unshallow: a previous boundary now included with its parents included too.
   const unshallow: string[] = [];
@@ -289,9 +303,13 @@ export function selectFetchObjects(
 // ---------------------------------------------------------------------------------------------
 
 /** The v2 capability advertisement: `version 2` then capability lines, then flush. */
-export function v2Advertisement(): Buffer {
+const V2_ADVERTISEMENT: Buffer = (() => {
   const lines = ['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n'];
   return Buffer.concat([...lines.map((line) => pktLine(line)), pktFlush()]);
+})();
+
+export function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 function capabilitiesString(caps: readonly string[]): string {
@@ -300,6 +318,16 @@ function capabilitiesString(caps: readonly string[]): string {
 
 /** The v0 ref advertisement for a service, with the `# service=` preamble. */
 export function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${service}:${repo.refsGen}`;
+  const cached = repo.v0AdvCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const built = buildV0Advertisement(repo, service);
+  if (repo.v0AdvCache.size >= 4) repo.v0AdvCache.clear();
+  repo.v0AdvCache.set(cacheKey, built);
+  return built;
+}
+
+function buildV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
   const caps =
     service === 'git-upload-pack'
@@ -333,6 +361,15 @@ export function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-re
 
 /** Handle a v2 ls-refs command; `args` are the lines after the delim packet. */
 export function handleLsRefs(repo: Repo, args: readonly string[]): Buffer {
+  const cacheKey = `${repo.refsGen}|${args.join('\n')}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const built = buildLsRefs(repo, args);
+  repo.cacheLsRefs(cacheKey, built);
+  return built;
+}
+
+function buildLsRefs(repo: Repo, args: readonly string[]): Buffer {
   let peel = false;
   let symrefs = false;
   let unborn = false;
@@ -403,47 +440,45 @@ function buildPackForSelection(selection: FetchSelection): Buffer {
   // Always a pack, even an empty one: the packfile section is part of every
   // fetch response, and a client that asked for nothing new still expects
   // the section (with a zero-object pack) rather than the response ending.
-  const objects = selection.objects.map((object) => ({ type: object.type, data: object.data }));
-  return writePack(objects);
+  return writePack(selection.objects);
 }
 
-/** The deepest client 'have' that is already an ancestor of a wanted tip. */
-function deepestCommonHave(repo: Repo, wants: readonly string[], haves: readonly string[]): string | null {
-  let best: string | null = null;
-  let bestDepth = -1;
-  for (const have of haves) {
-    if (!repo.objects.has(have)) continue;
-    for (const want of wants) {
-      if (!isAncestor(repo.lookup, have, want)) continue;
-      const depth = commitDepth(repo, have);
-      if (depth > bestDepth) {
-        best = have;
-        bestDepth = depth;
-      }
-    }
-  }
-  return best;
-}
-
-/** Generation (distance from the root) of a commit, for ranking haves. */
-function commitDepth(repo: Repo, oid: string): number {
-  let depth = 0;
-  let current: string | null = oid;
-  const seen = new Set<string>();
-  while (current !== null && !seen.has(current)) {
-    seen.add(current);
-    const obj = repo.lookup(current);
-    if (!obj || obj.type !== 'commit') break;
-    const parents = parseCommit(obj.data).parents;
-    current = parents.length > 0 ? parents[0] : null;
-    depth += 1;
-  }
-  return depth;
+/**
+ * The cache key for a fetch response: the fetch's inputs plus the repo's
+ * object generation. Fetch selection reads only the object set (never refs),
+ * and objects are immutable and append-only, so a key with the generation
+ * names exactly the store state the response was built from; any later push
+ * bumps the generation and the key misses.
+ */
+function fetchCacheKey(
+  protocol: 'v2' | 'v0',
+  repo: Repo,
+  parsed: FetchArgs,
+): string {
+  return [
+    protocol,
+    String(repo.gen),
+    parsed.wants.join(','),
+    parsed.haves.join(','),
+    parsed.shallow.join(','),
+    parsed.depth === undefined ? '' : String(parsed.depth),
+    parsed.deepenRelative ? 'rel' : '',
+    parsed.done ? 'done' : '',
+  ].join('|');
 }
 
 /** A v2 fetch response: acknowledgments, shallow-info, packfile sections. */
 export function handleFetchV2(repo: Repo, args: readonly string[]): Buffer {
   const parsed = parseFetchArgs(args);
+  const key = fetchCacheKey('v2', repo, parsed);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildFetchV2(repo, parsed);
+  repo.cacheFetch(key, built);
+  return built;
+}
+
+function buildFetchV2(repo: Repo, parsed: FetchArgs): Buffer {
   const selection = selectFetchObjects(repo, parsed.wants, parsed.haves, parsed.shallow, parsed.depth, parsed.deepenRelative);
   const pack = buildPackForSelection(selection);
   const parts: Buffer[] = [];
@@ -484,9 +519,52 @@ export function handleFetchV2(repo: Repo, args: readonly string[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The deepest client 'have' that is already an ancestor of a wanted tip. */
+function deepestCommonHave(repo: Repo, wants: readonly string[], haves: readonly string[]): string | null {
+  let best: string | null = null;
+  let bestDepth = -1;
+  for (const have of haves) {
+    if (!repo.objects.has(have)) continue;
+    for (const want of wants) {
+      if (!isAncestor(repo.lookup, have, want)) continue;
+      const depth = commitDepth(repo, have);
+      if (depth > bestDepth) {
+        best = have;
+        bestDepth = depth;
+      }
+    }
+  }
+  return best;
+}
+
+/** Generation (distance from the root) of a commit, for ranking haves. */
+function commitDepth(repo: Repo, oid: string): number {
+  let depth = 0;
+  let current: string | null = oid;
+  const seen = new Set<string>();
+  while (current !== null && !seen.has(current)) {
+    seen.add(current);
+    const obj = repo.lookup(current);
+    if (!obj || obj.type !== 'commit') break;
+    const parents = parseCommit(obj.data).parents;
+    current = parents.length > 0 ? parents[0] : null;
+    depth += 1;
+  }
+  return depth;
+}
+
 /** A v0 fetch response: NAK, shallow lines, then the sideband pack. */
 export function handleFetchV0(repo: Repo, args: readonly string[]): Buffer {
   const parsed = parseFetchArgs(args);
+  const key = fetchCacheKey('v0', repo, parsed);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildFetchV0(repo, parsed);
+  repo.cacheFetch(key, built);
+  return built;
+}
+
+function buildFetchV0(repo: Repo, parsed: FetchArgs): Buffer {
   const selection = selectFetchObjects(repo, parsed.wants, parsed.haves, parsed.shallow, parsed.depth, parsed.deepenRelative);
   const pack = buildPackForSelection(selection);
   const parts: Buffer[] = [];
@@ -526,10 +604,8 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
   const commands: PushCommand[] = [];
   let sawFlush = false;
   while (offset < body.length) {
-    if (offset + 4 > body.length) return { status: 400, body: Buffer.alloc(0) };
-    const head = body.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4.test(head)) return { status: 400, body: Buffer.alloc(0) };
-    const length = Number.parseInt(head, 16);
+    const length = pktLengthAt(body, offset);
+    if (length < 0) return { status: 400, body: Buffer.alloc(0) };
     if (length === 0) {
       offset += 4;
       sawFlush = true;
@@ -558,9 +634,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { status: number; b
     } else {
       try {
         const entries = readPack(packBytes, { resolveBase: repo.lookup });
-        for (const entry of entries) {
-          if (!repo.objects.has(entry.oid)) repo.objects.set(entry.oid, { type: entry.type, data: entry.data });
-        }
+        repo.storePackEntries(entries);
       } catch (err) {
         unpackOk = false;
         unpackDetail = err instanceof Error ? err.message : 'unpacker error';
@@ -596,7 +670,7 @@ function applyPushCommand(repo: Repo, command: PushCommand, unpackOk: boolean): 
     // Delete.
     if (current === undefined) return fail('remote ref does not exist');
     if (command.oldOid !== ZERO_OID && command.oldOid !== current) return fail('non-fast-forward');
-    repo.refs.delete(command.ref);
+    repo.deleteRef(command.ref);
     return { ref: command.ref, ok: true, reason: '' };
   }
   const target = repo.objects.get(command.newOid);
@@ -604,19 +678,26 @@ function applyPushCommand(repo: Repo, command: PushCommand, unpackOk: boolean): 
   if (command.oldOid === ZERO_OID) {
     // Create.
     if (current !== undefined) return fail('already exists');
-    repo.refs.set(command.ref, command.newOid);
+    repo.setRef(command.ref, command.newOid);
     return { ref: command.ref, ok: true, reason: '' };
   }
   // Update: old must match the current tip and new must descend from old.
   if (current === undefined) return fail('remote ref does not exist');
   if (command.oldOid !== current) return fail('non-fast-forward');
   if (target.type === 'commit') {
-    if (!isAncestor(repo.lookup, command.oldOid, command.newOid)) return fail('non-fast-forward');
+    // Fast path: the overwhelmingly common push appends one commit whose
+    // parent IS the old tip, so the fast-forward check is one parse and one
+    // array scan instead of a walk of the whole history. Anything else
+    // (a merge, a rebase onto an older base) falls back to the full walk.
+    const parents = parseCommit(target.data).parents;
+    if (!parents.includes(command.oldOid) && !isAncestor(repo.lookup, command.oldOid, command.newOid)) {
+      return fail('non-fast-forward');
+    }
   } else if (target.type === 'tag') {
     // A tag update fast-forwards only when it points at the same object.
     if (command.newOid !== command.oldOid) return fail('non-fast-forward');
   }
-  repo.refs.set(command.ref, command.newOid);
+  repo.setRef(command.ref, command.newOid);
   return { ref: command.ref, ok: true, reason: '' };
 }
 

@@ -12,6 +12,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   FIXED_ISO,
   Store,
+  invalidateIssueJson,
   VIEWER_EMAIL,
   VIEWER_ID,
   VIEWER_LOGIN,
@@ -48,7 +49,11 @@ function nextRequestId(): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  sendJsonText(res, status, `${JSON.stringify(body)}\n`, headers);
+}
+
+/** Send an already-serialized JSON body (a cached response skips stringify). */
+function sendJsonText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
@@ -97,19 +102,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function queryOf(req: IncomingMessage): URLSearchParams {
+/** Parse the request URL once: pathname + query, shared by every layer. */
+function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return new URLSearchParams();
-  }
-}
-
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
@@ -121,8 +120,8 @@ function hostOf(req: IncomingMessage): string {
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
-  const match = /^Bearer (.+)$/.exec(header.trim());
-  return match ? match[1] : null;
+  if (!header.startsWith('Bearer ')) return null;
+  return header.slice('Bearer '.length).trim();
 }
 
 /** True when the request carries the trial token (or no token is configured). */
@@ -142,7 +141,10 @@ function decodeSegment(segment: string): string {
 
 /** Split a path into decoded segments, dropping empty ones. */
 function segments(path: string): string[] {
-  return path.split('/').filter((part) => part !== '').map(decodeSegment);
+  return path
+    .split('/')
+    .filter((part) => part !== '')
+    .map((part) => (part.includes('%') ? decodeSegment(part) : part));
 }
 
 function parsePage(query: URLSearchParams): { perPage: number; page: number } {
@@ -243,8 +245,7 @@ export function createApp(): Server {
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse, store: Store): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = pathOf(req);
-  const query = queryOf(req);
+  const { path, query } = parseUrl(req);
 
   // The env's boot probe: 200 {"ok":true}, no token.
   if (method === 'GET' && path === '/healthz') {
@@ -255,7 +256,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, store: S
   // Git smart HTTP: /{owner}/{repo}.git/...
   const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
   if (gitMatch) {
-    await handleGit(req, res, store, gitMatch[1], gitMatch[2], gitMatch[3] ?? '/');
+    await handleGit(req, res, store, gitMatch[1], gitMatch[2], gitMatch[3] ?? '/', query);
     return;
   }
 
@@ -350,10 +351,10 @@ async function handleGit(
   owner: string,
   repoName: string,
   suffix: string,
+  query: URLSearchParams,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const repo = store.getRepo(owner, repoName);
-  const query = queryOf(req);
   if (suffix === '/info/refs' && method === 'GET') {
     const service = query.get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -596,7 +597,7 @@ async function handleRepoRoute(
       sendJson(res, 422, { message: 'Reference already exists' });
       return;
     }
-    repo.refs.set(ref, sha);
+    repo.setRef(ref, sha);
     sendJson(res, 201, { ref, object: { sha }, url: `${basePath}/git/refs/${encodeURIComponent(ref)}` });
     return;
   }
@@ -870,8 +871,9 @@ async function handleIssues(
         state: 'open',
         labels,
         comments: [],
+        jsonCache: null,
       };
-      repo.issues.push(issue);
+      repo.addIssue(issue);
       sendJson(res, 201, issueJson(repo, issue));
       return;
     }
@@ -901,7 +903,7 @@ async function handleIssues(
     notFound(res);
     return;
   }
-  const issue = repo.issues.find((entry) => entry.number === number);
+  const issue = repo.findIssue(number);
   if (!issue) {
     notFound(res);
     return;
@@ -910,7 +912,12 @@ async function handleIssues(
   // GET / PATCH /repos/{o}/{r}/issues/{n}
   if (tail.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      // The read workload asks for the same issue thousands of times and the
+      // server invents no timestamps: the serialized JSON is identical every
+      // time, so it is built once and served from the issue's cache until a
+      // mutation clears it.
+      if (issue.jsonCache === null) issue.jsonCache = `${JSON.stringify(issueJson(repo, issue))}\n`;
+      sendJsonText(res, 200, issue.jsonCache);
       return;
     }
     if (method === 'PATCH') {
@@ -924,6 +931,7 @@ async function handleIssues(
       if (typeof input.title === 'string') issue.title = input.title;
       if (typeof input.body === 'string') issue.body = input.body;
       if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
+      invalidateIssueJson(issue);
       sendJson(res, 200, issueJson(repo, issue));
       return;
     }
@@ -944,6 +952,7 @@ async function handleIssues(
       const commentBody = typeof input.body === 'string' ? input.body : '';
       const comment = { id: repo.nextCommentId++, body: commentBody };
       issue.comments.push(comment);
+      invalidateIssueJson(issue);
       sendJson(res, 201, { id: comment.id, body: comment.body });
       return;
     }
@@ -1010,7 +1019,7 @@ async function handlePulls(
         mergedAt: null,
         mergeSha: null,
       };
-      repo.pulls.push(pull);
+      repo.addPull(pull);
       sendJson(res, 201, pullJson(repo, pull));
       return;
     }
@@ -1035,7 +1044,7 @@ async function handlePulls(
     notFound(res);
     return;
   }
-  const pull = repo.pulls.find((entry) => entry.number === number);
+  const pull = repo.findPull(number);
 
   // GET /repos/{o}/{r}/pulls/{n}/files
   if (tail.length === 2 && tail[1] === 'files') {
@@ -1097,7 +1106,7 @@ async function handlePulls(
     pull.mergedAt = FIXED_ISO;
     pull.mergeSha = mergeSha;
     pull.state = 'closed';
-    repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    repo.setRef(`refs/heads/${pull.baseRef}`, mergeSha);
     sendJson(res, 200, { sha: mergeSha, merged: true, message: `Merged pull request #${pull.number}` });
     return;
   }

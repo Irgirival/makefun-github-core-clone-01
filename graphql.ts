@@ -21,6 +21,7 @@ import {
   Store,
   VIEWER_LOGIN,
   VIEWER_NAME,
+  invalidateIssueJson,
   isOid,
   lineDiffCounts,
   parseCommit,
@@ -513,7 +514,7 @@ function executeRepositoryField(ctx: ExecContext, repo: Repo, field: GqlField, s
     case 'issue': {
       const number = argValue(field, 'number', ctx.variables);
       if (typeof number !== 'number') return null;
-      const issue = repo.issues.find((entry) => entry.number === number);
+      const issue = repo.findIssue(number);
       if (!issue) return null;
       return executeFields(ctx, 'Issue', { repo, issue }, selection);
     }
@@ -534,7 +535,7 @@ function executeRepositoryField(ctx: ExecContext, repo: Repo, field: GqlField, s
     case 'pullRequest': {
       const number = argValue(field, 'number', ctx.variables);
       if (typeof number !== 'number') return null;
-      const pull = repo.pulls.find((entry) => entry.number === number);
+      const pull = repo.findPull(number);
       if (!pull) return null;
       return executeFields(ctx, 'PullRequest', { repo, pull }, selection);
     }
@@ -845,7 +846,7 @@ function findIssueByGlobalId(store: Store, id: string): { repo: Repo; issue: Iss
     if (!match) return null;
     const repo = store.getRepo(match[1], match[2]);
     if (!repo) return null;
-    const issue = repo.issues.find((entry) => entry.number === Number.parseInt(match[3], 10));
+    const issue = repo.findIssue(Number.parseInt(match[3], 10));
     return issue ? { repo, issue } : null;
   } catch {
     return null;
@@ -859,7 +860,7 @@ function findPullByGlobalId(store: Store, id: string): { repo: Repo; pull: PullR
     if (!match) return null;
     const repo = store.getRepo(match[1], match[2]);
     if (!repo) return null;
-    const pull = repo.pulls.find((entry) => entry.number === Number.parseInt(match[3], 10));
+    const pull = repo.findPull(Number.parseInt(match[3], 10));
     return pull ? { repo, pull } : null;
   } catch {
     return null;
@@ -896,8 +897,9 @@ function executeMutationField(ctx: ExecContext, field: GqlField): unknown {
         state: 'open',
         labels: [],
         comments: [],
+        jsonCache: null,
       };
-      repo.issues.push(issue);
+      repo.addIssue(issue);
       const out: Record<string, unknown> = {};
       for (const sub of selection) {
         if (sub.name === 'issue') out[sub.alias ?? sub.name] = executeFields(ctx, 'Issue', { repo, issue }, sub.selection ?? []);
@@ -911,6 +913,7 @@ function executeMutationField(ctx: ExecContext, field: GqlField): unknown {
       const found = findIssueByGlobalId(ctx.store, issueId);
       if (!found) return null;
       found.issue.state = 'closed';
+      invalidateIssueJson(found.issue);
       const out: Record<string, unknown> = {};
       for (const sub of selection) {
         if (sub.name === 'issue') out[sub.alias ?? sub.name] = executeFields(ctx, 'Issue', found, sub.selection ?? []);
@@ -944,7 +947,7 @@ function executeMutationField(ctx: ExecContext, field: GqlField): unknown {
         mergedAt: null,
         mergeSha: null,
       };
-      repo.pulls.push(pull);
+      repo.addPull(pull);
       const out: Record<string, unknown> = {};
       for (const sub of selection) {
         if (sub.name === 'pullRequest') out[sub.alias ?? sub.name] = executeFields(ctx, 'PullRequest', { repo, pull }, sub.selection ?? []);
@@ -965,7 +968,7 @@ function executeMutationField(ctx: ExecContext, field: GqlField): unknown {
           pull.mergedAt = FIXED_ISO;
           pull.mergeSha = mergeSha;
           pull.state = 'closed';
-          repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+          repo.setRef(`refs/heads/${pull.baseRef}`, mergeSha);
         }
       }
       const out: Record<string, unknown> = {};
@@ -983,6 +986,7 @@ function executeMutationField(ctx: ExecContext, field: GqlField): unknown {
       if (!found) return null;
       const comment = { id: found.repo.nextCommentId++, body };
       found.issue.comments.push(comment);
+      invalidateIssueJson(found.issue);
       const out: Record<string, unknown> = {};
       for (const sub of selection) {
         if (sub.name === 'commentEdge') {

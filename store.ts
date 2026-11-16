@@ -46,7 +46,7 @@ const CODE_TYPE: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'b
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\0`, 'utf8'));
+  hash.update(`${type} ${body.length}\0`);
   hash.update(body);
   return hash.digest('hex');
 }
@@ -465,7 +465,7 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
 }
 
 /** Build a packfile from plain objects (no deltas): small, correct, fast to build. */
-export function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Array }>): Buffer {
+export function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Array; oid?: string }>): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
@@ -476,10 +476,29 @@ export function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Ar
   for (const object of list) {
     const data = Buffer.isBuffer(object.data) ? object.data : Buffer.from(object.data);
     parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    parts.push(deflatedFor(object.type, data, object.oid));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+}
+
+/**
+ * The deflated bytes of an object, cached by oid: object data is immutable,
+ * so the same object deflates to the same bytes on every pack that carries it.
+ * The cache is bounded; when it fills it is dropped whole (a cold cache is
+ * correct, never stale).
+ */
+const DEFLATED_CACHE = new Map<string, Buffer>();
+const DEFLATED_CACHE_MAX = 8192;
+
+function deflatedFor(type: GitObjectType, data: Buffer, oid: string | undefined): Buffer {
+  const key = oid ?? hashObject(type, data);
+  const cached = DEFLATED_CACHE.get(key);
+  if (cached !== undefined) return cached;
+  const deflated = deflateSync(data);
+  if (DEFLATED_CACHE.size >= DEFLATED_CACHE_MAX) DEFLATED_CACHE.clear();
+  DEFLATED_CACHE.set(key, deflated);
+  return deflated;
 }
 
 /** SHA-1 of every pack byte before the 20-byte trailer. */
@@ -513,6 +532,13 @@ export interface Issue {
   state: 'open' | 'closed';
   labels: string[];
   comments: IssueComment[];
+  /** Serialized REST JSON of this issue, or null when it must be rebuilt. */
+  jsonCache: string | null;
+}
+
+/** Drop an issue's cached REST JSON after any mutation of the issue. */
+export function invalidateIssueJson(issue: Issue): void {
+  issue.jsonCache = null;
 }
 
 export interface PullRequest {
@@ -547,6 +573,25 @@ export class Repo {
   nextCommentId = 1;
   /** Sequence for server-invented commit timestamps (deterministic). */
   seq = 0;
+  /**
+   * Bumped whenever an object is stored: fetch selection depends only on the
+   * object set, so this generation is the fetch cache's freshness key.
+   */
+  gen = 0;
+  /** Bumped whenever a ref is set or deleted: the ls-refs / advertisement cache key. */
+  refsGen = 0;
+  /** O(1) lookup of issues and pulls by number (the arrays stay the order). */
+  readonly issuesByNumber = new Map<number, Issue>();
+  readonly pullsByNumber = new Map<number, PullRequest>();
+  /**
+   * Cached fetch responses (whole response Buffer), keyed by the fetch's
+   * inputs plus `gen`. Bounded FIFO: the oldest entry goes when it fills.
+   */
+  readonly fetchCache = new Map<string, Buffer>();
+  /** Cached ls-refs responses, keyed by refsGen + the ls-refs arguments. */
+  readonly lsRefsCache = new Map<string, Buffer>();
+  /** Cached v0 ref advertisements, keyed by service + refsGen. */
+  readonly v0AdvCache = new Map<string, Buffer>();
 
   constructor(owner: string, name: string, id: number, description: string, isPrivate: boolean) {
     this.owner = owner;
@@ -557,17 +602,82 @@ export class Repo {
     this.isPrivate = isPrivate;
   }
 
+  /** Store a ref (bumps refsGen; the ls-refs / advertisement caches key on it). */
+  setRef(name: string, oid: string): void {
+    this.refs.set(name, oid);
+    this.refsGen += 1;
+  }
+
+  /** Delete a ref (bumps refsGen). */
+  deleteRef(name: string): void {
+    if (this.refs.delete(name)) this.refsGen += 1;
+  }
+
+  /** Store one object, bumping the object generation. Returns its id. */
+  putObject(type: GitObjectType, data: Buffer): string {
+    const oid = hashObject(type, data);
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.gen += 1;
+    }
+    return oid;
+  }
+
+  /** Store a whole unpacked pack's entries, bumping the generation once. */
+  storePackEntries(entries: readonly { type: GitObjectType; data: Buffer; oid: string }[]): void {
+    let added = false;
+    for (const entry of entries) {
+      if (!this.objects.has(entry.oid)) {
+        this.objects.set(entry.oid, { type: entry.type, data: entry.data });
+        added = true;
+      }
+    }
+    if (added) this.gen += 1;
+  }
+
+  /** Add an issue, keeping the by-number index in step. */
+  addIssue(issue: Issue): void {
+    this.issues.push(issue);
+    this.issuesByNumber.set(issue.number, issue);
+  }
+
+  /** Add a pull request, keeping the by-number index in step. */
+  addPull(pull: PullRequest): void {
+    this.pulls.push(pull);
+    this.pullsByNumber.set(pull.number, pull);
+  }
+
+  findIssue(number: number): Issue | undefined {
+    return this.issuesByNumber.get(number) ?? this.issues.find((entry) => entry.number === number);
+  }
+
+  findPull(number: number): PullRequest | undefined {
+    return this.pullsByNumber.get(number) ?? this.pulls.find((entry) => entry.number === number);
+  }
+
+  /** Cache a fetch response, evicting the oldest entry when the cache fills. */
+  cacheFetch(key: string, body: Buffer): void {
+    if (this.fetchCache.size >= 64) {
+      const oldest = this.fetchCache.keys().next();
+      if (!oldest.done) this.fetchCache.delete(oldest.value);
+    }
+    this.fetchCache.set(key, body);
+  }
+
+  /** Cache an ls-refs response, evicting the oldest entry when it fills. */
+  cacheLsRefs(key: string, body: Buffer): void {
+    if (this.lsRefsCache.size >= 32) {
+      const oldest = this.lsRefsCache.keys().next();
+      if (!oldest.done) this.lsRefsCache.delete(oldest.value);
+    }
+    this.lsRefsCache.set(key, body);
+  }
+
   get fullName(): string {
     return `${this.owner}/${this.name}`;
   }
 
   lookup = (oid: string): GitObject | undefined => this.objects.get(oid);
-
-  putObject(type: GitObjectType, data: Buffer): string {
-    const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
-    return oid;
-  }
 
   refTip(ref: string): string | undefined {
     return this.refs.get(ref);
@@ -661,7 +771,7 @@ export class Repo {
     const treeOid = this.buildTreeFromFiles(files);
     const parents = tip === undefined ? [] : [tip];
     const commitOid = this.createCommit(treeOid, parents, message);
-    this.refs.set(`refs/heads/${branch}`, commitOid);
+    this.setRef(`refs/heads/${branch}`, commitOid);
     return commitOid;
   }
 

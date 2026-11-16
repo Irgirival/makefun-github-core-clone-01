@@ -39,6 +39,29 @@ suite presents; when it is unset, auth is not enforced (local development).
 - `graphql.ts` — a small GraphQL parser + executor for the suite's documents.
 - `mcp.ts` — the MCP endpoint and its twelve tools.
 
+## v2: caching + fast parser
+
+v2 keeps v1's wire behaviour byte for byte and removes repeated work:
+
+- **Fetch cache**: a fetch response (selection + pack + framing) is cached per
+  repository, keyed by the fetch's inputs plus the object generation, which
+  bumps on every stored object. Objects are immutable and append-only, so a
+  cached response is never stale; a later push bumps the generation and the
+  key misses. The clone workload's 50 identical depth-1 clones build the pack
+  once.
+- **Deflate cache**: pack object bytes are deflated once per oid and reused
+  across packs (object data is immutable).
+- **Advertisement / ls-refs caches**: the v2 advertisement is a constant; the
+  v0 advertisement and ls-refs responses are cached per refs generation.
+- **Push fast path**: a push whose new commit's parent is the old tip is
+  confirmed fast-forward with one parse instead of a walk of the whole
+  history; merges and rebases still take the full ancestor walk.
+- **REST fast path**: one URL parse per request, percent-decoding only when a
+  segment carries `%`, O(1) issue/pull lookup by number, and the serialized
+  JSON of an issue cached on the issue until a mutation clears it (the read
+  workload asks for the same issue 2,000 times).
+- **Fast pkt-line decoding**: hex lengths parsed by table lookup, no regex.
+
 Determinism: the server invents no timestamps and no unseeded randomness —
 server-created commits use a fixed epoch plus a sequence number, and global
 ids are derived from stable identities — so a replay of a trial sees the same
